@@ -28,3 +28,4 @@ cmd/tsshd/tsshd
 node_modules/
 wasmtest/dist
 wasmtest/*.wasm
+wasmtest/*.gz
