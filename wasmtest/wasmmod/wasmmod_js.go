@@ -8,7 +8,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -26,6 +25,7 @@ import (
 	"time"
 
 	"github.com/skip2/go-qrcode"
+	"golang.org/x/crypto/ssh"
 	"tailscale.com/cmd/tailscale/cli"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
@@ -41,6 +41,9 @@ import (
 )
 
 func main() {
+	inputChan := make(chan []byte, 10)
+	inSSH := false
+
 	netns.SetEnabled(false)
 	var logf logger.Logf = log.Printf
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{})
@@ -321,7 +324,6 @@ func main() {
 		}
 		go func() {
 			onDone := args[1]
-			defer onDone.Invoke() // re-print the prompt
 
 			line := args[0].String()
 			f := strings.Fields(line)
@@ -329,22 +331,153 @@ func main() {
 
 			term := js.Global().Get("theTerminal")
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			c, err := socksSrv.Dialer(ctx, "tcp", net.JoinHostPort(host, "22"))
+			log.Println("Here we go")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+			c, err := socksSrv.Dialer(ctx, "tcp", net.JoinHostPort(host, "2200"))
 			if err != nil {
 				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+				cancel()
 				return
 			}
-			defer c.Close()
-			br := bufio.NewReader(c)
-			greet, err := br.ReadString('\n')
+			log.Println("TCP Connected")
+
+			config := &ssh.ClientConfig{
+				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+				User:            "user",
+				Auth: []ssh.AuthMethod{
+					ssh.Password("1234"),
+				},
+			}
+			sshConn, _, _, err := ssh.NewClientConn(c, host, config)
+
 			if err != nil {
 				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+				c.Close()
+				cancel()
 				return
 			}
-			term.Call("write", fmt.Sprintf("%v\r\n\r\nTODO(bradfitz): rest of the owl", strings.TrimSpace(greet)))
+			log.Println("SSH Connected")
+
+			sshClient := ssh.NewClient(sshConn, nil, nil)
+
+			session, err := sshClient.NewSession()
+			if err != nil {
+				log.Println("Session Failed")
+				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+				sshClient.Close()
+				sshConn.Close()
+				c.Close()
+				cancel()
+				return
+			}
+			log.Println("Session Established")
+
+			stdin, err := session.StdinPipe()
+			if err != nil {
+				fmt.Println(err.Error())
+			}
+
+			stdout, err := session.StdoutPipe()
+			if err != nil {
+				fmt.Println(err.Error())
+			}
+
+			stderr, err := session.StderrPipe()
+			if err != nil {
+				fmt.Println(err.Error())
+			}
+
+			log.Println("Pipes ready")
+			inSSH = true
+			term.Set("_inSSH", true)
+
+			done := make(chan bool, 1)
+			// Input
+			go func() {
+				defer onDone.Invoke() // re-print the prompt
+				defer cancel()
+				defer c.Close()
+				defer sshConn.Close()
+				defer sshClient.Close()
+				defer session.Close()
+
+				for {
+					select {
+					case d := <-inputChan:
+						_, err := stdin.Write(d)
+						if err != nil {
+							term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+						}
+					case <-done:
+						log.Printf("Closing reader")
+						return
+					}
+				}
+			}()
+
+			// Output + Err
+			go func() {
+				output := make([]byte, 512)
+				for {
+					n, err := stdout.Read(output)
+					if err != nil {
+						term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+						return
+					}
+					term.Call("write", string(output[:n]))
+				}
+			}()
+
+			go func() {
+				output := make([]byte, 512)
+				for {
+					n, err := stderr.Read(output)
+					if err != nil {
+						term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+						break
+					}
+					term.Call("write", string(output[:n]))
+				}
+				log.Printf("Closed connection")
+				done <- true
+				inSSH = false
+				term.Set("_inSSH", false)
+			}()
+
+			err = session.RequestPty("xterm", term.Get("rows").Int(), term.Get("cols").Int(), ssh.TerminalModes{})
+
+			if err != nil {
+				log.Fatal("request for pseudo terminal failed: ", err)
+				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+				session.Close()
+				sshClient.Close()
+				sshConn.Close()
+				c.Close()
+				cancel()
+				return
+			}
+
+			err = session.Shell()
+			if err != nil {
+				log.Println("Session Failed")
+				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+				session.Close()
+				sshClient.Close()
+				sshConn.Close()
+				c.Close()
+				cancel()
+				return
+			}
+			log.Println("Shell started")
+
 		}()
+		return nil
+	}))
+
+	js.Global().Set("sendSSHInput", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		input := args[0].String()
+		inputChan <- []byte(input)
 		return nil
 	}))
 
