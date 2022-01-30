@@ -16,24 +16,18 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
-	"os"
-	"runtime"
-	"strings"
 	"sync"
 	"syscall/js"
 	"time"
 
 	"github.com/skip2/go-qrcode"
 	"golang.org/x/crypto/ssh"
-	"tailscale.com/cmd/tailscale/cli"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/socks5/tssocks"
 	"tailscale.com/net/tstun"
-	"tailscale.com/safesocket"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
@@ -41,8 +35,9 @@ import (
 )
 
 func main() {
+	var mut sync.Mutex
+
 	inputChan := make(chan []byte, 10)
-	inSSH := false
 
 	netns.SetEnabled(false)
 	var logf logger.Logf = log.Printf
@@ -60,13 +55,11 @@ func main() {
 	}
 	ns.ProcessLocalIPs = true
 	ns.ProcessSubnets = true
-	ns.ForwardTCPIn = handleIncomingTCP
 	if err := ns.Start(); err != nil {
 		log.Fatalf("failed to start netstack: %v", err)
 	}
 
 	doc := js.Global().Get("document")
-	state := doc.Call("getElementById", "state")
 	topBar := doc.Call("getElementById", "topbar")
 	topBarStyle := topBar.Get("style")
 	netmapEle := doc.Call("getElementById", "netmap")
@@ -95,20 +88,17 @@ func main() {
 	}
 	lb := srv.LocalBackend()
 
-	state.Set("innerHTML", "ready")
-
 	lb.SetNotifyCallback(func(n ipn.Notify) {
 		log.Printf("NOTIFY: %+v", n)
-		if n.State != nil {
-			state.Set("innerHTML", fmt.Sprint(*n.State))
-			switch *n.State {
-			case ipn.Running, ipn.Starting:
-				loginEle.Set("innerHTML", "")
-			}
+		if n.LoginFinished != nil {
+			loginEle.Set("innerHTML", "")
+			topBar.Set("innerHTML", "<div>Step 3: Connect to ssh!</div>")
 		}
+
 		if nm := n.NetMap; nm != nil {
 			var buf bytes.Buffer
-			fmt.Fprintf(&buf, "<p>Name: <b>%s</b></p>\n", html.EscapeString(nm.Name))
+			fmt.Fprintf(&buf, "<h2>Tailscale info</h2><input type=button value='Logout' onclick='logoutClicked()'>")
+			fmt.Fprintf(&buf, "<p>Name: <b>%s</b></p>", html.EscapeString(nm.Name))
 			fmt.Fprintf(&buf, "<p>Addresses: ")
 			for i, a := range nm.Addresses {
 				if i == 0 {
@@ -118,15 +108,17 @@ func main() {
 				}
 			}
 			fmt.Fprintf(&buf, "</p>")
-			fmt.Fprintf(&buf, "<p>Machine: <b>%v</b>, %v</p>\n", nm.MachineStatus, nm.MachineKey)
-			fmt.Fprintf(&buf, "<p>Nodekey: %v</p>\n", nm.NodeKey)
+			fmt.Fprintf(&buf, "<p>Machine: <b>%v</b>, %v</p>", nm.MachineStatus, nm.MachineKey)
+			fmt.Fprintf(&buf, "<p>Nodekey: %v</p>", nm.NodeKey)
 			fmt.Fprintf(&buf, "<hr><table>")
 			for _, p := range nm.Peers {
 				var ip string
 				if len(p.Addresses) > 0 {
 					ip = p.Addresses[0].IP().String()
 				}
-				fmt.Fprintf(&buf, "<tr><td>%s</td><td>%s</td></tr>\n", ip, html.EscapeString(p.Name))
+				fmt.Fprintf(&buf, `<tr><td>%s</td><td>%s</td>`, ip, html.EscapeString(p.Name))
+				fmt.Fprintf(&buf, `<td><button onclick="runSSH('%s')">Connect to port 2200</button></td></tr>`, ip)
+
 			}
 			fmt.Fprintf(&buf, "</table>")
 			netmapEle.Set("innerHTML", buf.String())
@@ -135,15 +127,13 @@ func main() {
 			esc := html.EscapeString(*n.BrowseToURL)
 			pngBytes, _ := qrcode.Encode(*n.BrowseToURL, qrcode.Medium, 256)
 			qrDataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
-			loginEle.Set("innerHTML", fmt.Sprintf("<a href='%s' target=_blank>%s<br/><img src='%s' border=0></a>", esc, esc, qrDataURL))
+			loginEle.Set("innerHTML", fmt.Sprintf("<a href='%s' target=_blank><br/><img src='%s' border=0></a>", esc, qrDataURL))
 		}
 	})
 
 	start := func() {
 		err := lb.Start(ipn.Options{
 			Prefs: &ipn.Prefs{
-				// go run ./cmd/trunkd/  -remote-url=https://controlplane.tailscale.com
-				//ControlURL:       "http://tsdev:8080",
 				ControlURL:       "https://controlplane.tailscale.com",
 				RouteAll:         false,
 				AllowSingleHosts: true,
@@ -152,13 +142,9 @@ func main() {
 			},
 		})
 		log.Printf("Start error: %v", err)
-
+		lb.StartLoginInteractive()
 	}
-
-	js.Global().Set("startClicked", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		go start()
-		return nil
-	}))
+	go start()
 
 	js.Global().Set("logoutClicked", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 		log.Printf("Logout clicked")
@@ -166,181 +152,41 @@ func main() {
 			log.Printf("Backend not running")
 			return nil
 		}
-		go lb.Logout()
-		return nil
-	}))
-
-	js.Global().Set("startLoginInteractive", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		log.Printf("State: %v", lb.State)
-
 		go func() {
-			if lb.State() == ipn.NoState {
-				start()
-			}
-			lb.StartLoginInteractive()
-		}()
-		return nil
-	}))
-
-	js.Global().Set("seeGoroutines", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		full := make([]byte, 1<<20)
-		buf := full[:runtime.Stack(full, true)]
-		js.Global().Get("theTerminal").Call("reset")
-		withCR := make([]byte, 0, len(buf)+bytes.Count(buf, []byte{'\n'}))
-		for _, b := range buf {
-			if b == '\n' {
-				withCR = append(withCR, "\r\n"...)
-			} else {
-				withCR = append(withCR, b)
-			}
-		}
-		js.Global().Get("theTerminal").Call("write", string(withCR))
-		return nil
-	}))
-
-	js.Global().Set("startAuthKey", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		authKey := args[0].String()
-		log.Printf("got auth key")
-		go func() {
-			err := lb.Start(ipn.Options{
-				Prefs: &ipn.Prefs{
-					// go run ./cmd/trunkd/  -remote-url=https://controlplane.tailscale.com
-					//ControlURL:       "http://tsdev:8080",
-					ControlURL:       "https://controlplane.tailscale.com",
-					RouteAll:         false,
-					AllowSingleHosts: true,
-					WantRunning:      true,
-					Hostname:         "wasm",
-				},
-				AuthKey: authKey,
-			})
-			log.Printf("Start error: %v", err)
-		}()
-		return nil
-	}))
-
-	var termOutOnce sync.Once
-
-	js.Global().Set("runTailscaleCLI", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		if len(args) < 1 {
-			log.Printf("missing args")
-			return nil
-		}
-		// TODO(bradfitz): enforce that we're only running one
-		// CLI command at a time, as we modify package cli
-		// globals below, like cli.Fatalf.
-
-		go func() {
-			if len(args) >= 2 {
-				onDone := args[1]
-				defer onDone.Invoke() // re-print the prompt
-			}
-			/*
-				fs := js.Global().Get("globalThis").Get("fs")
-				oldWriteSync := fs.Get("writeSync")
-				defer fs.Set("writeSync", oldWriteSync)
-
-				fs.Set("writeSync", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-					if len(args) != 2 {
-						return nil
-					}
-					js.Global().Get("theTerminal").Call("write", fmt.Sprintf("Got a %T %v\r\n", args[1], args[1]))
-					return nil
-				}))
-			*/
-			line := args[0].String()
-			f := strings.Fields(line)
-			term := js.Global().Get("theTerminal")
-			termOutOnce.Do(func() {
-				cli.Stdout = termWriter{term}
-				cli.Stderr = termWriter{term}
-			})
-
-			cli.Fatalf = func(format string, a ...interface{}) {
-				term.Call("write", strings.ReplaceAll(fmt.Sprintf(format, a...), "\n", "\n\r"))
-				runtime.Goexit()
-			}
-
-			// TODO(bradfitz): add a cli package global logger and make that
-			// package use it, rather than messing with log.SetOutput.
-			log.SetOutput(cli.Stderr)
-			defer log.SetOutput(os.Stderr) // back to console
-
-			defer func() {
-				if e := recover(); e != nil {
-					term.Call("write", fmt.Sprintf("%s\r\n", e))
-					fmt.Fprintf(os.Stderr, "recovered panic from %q: %v", f, e)
-				}
-			}()
-
-			if err := cli.Run(f[1:]); err != nil {
-				fmt.Fprintf(os.Stderr, "CLI error on %q: %v\n", f, err)
-				term.Call("write", fmt.Sprintf("%v\r\n", err))
-				return
-			}
-		}()
-		return nil
-	}))
-
-	js.Global().Set("runFakeCURL", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		if len(args) < 2 {
-			log.Printf("missing args")
-			return nil
-		}
-		go func() {
-			onDone := args[1]
-			defer onDone.Invoke() // re-print the prompt
-
-			line := args[0].String()
-			f := strings.Fields(line)
-			if len(f) < 2 {
-				return
-			}
-			wantURL := f[1]
-
-			term := js.Global().Get("theTerminal")
-
-			c := &http.Client{
-				Transport: &http.Transport{
-					DialContext: socksSrv.Dialer,
-				},
-			}
-
-			res, err := c.Get(wantURL)
-			if err != nil {
-				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
-				return
-			}
-			defer res.Body.Close()
-			res.Write(termWriter{term})
+			lb.Logout()
+			js.Global().Get("location").Call("reload") // There's probably a better way to get rid of terminal
 		}()
 		return nil
 	}))
 
 	js.Global().Set("runSSH", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		if len(args) < 2 {
+		if len(args) < 1 {
 			log.Printf("missing args")
 			return nil
 		}
 		go func() {
-			onDone := args[1]
+			mut.Lock()
+			defer mut.Unlock()
 
-			line := args[0].String()
-			f := strings.Fields(line)
-			host := f[1]
+			js.Global().Get("startTerminal").Invoke()
+
+			host := args[0].String()
 
 			term := js.Global().Get("theTerminal")
 
-			log.Println("Here we go")
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			term.Call("write", fmt.Sprintf("Connecting to %s:2200\r\n", host))
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			c, err := socksSrv.Dialer(ctx, "tcp", net.JoinHostPort(host, "2200"))
 			if err != nil {
-				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
-				cancel()
+				term.Call("write", fmt.Sprintf("Error establishing session: %v\r\n", err))
+				term.Call("write", "Try again or disconnect/reconnect to tailscale")
 				return
 			}
-			log.Println("TCP Connected")
+			term.Call("write", "TCP Session Established\r\n")
+			defer c.Close()
 
 			config := &ssh.ClientConfig{
 				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
@@ -349,29 +195,26 @@ func main() {
 					ssh.Password("1234"),
 				},
 			}
-			sshConn, _, _, err := ssh.NewClientConn(c, host, config)
 
+			sshConn, _, _, err := ssh.NewClientConn(c, host, config)
 			if err != nil {
 				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
-				c.Close()
-				cancel()
 				return
 			}
-			log.Println("SSH Connected")
+			defer sshConn.Close()
+			term.Call("write", "SSH Connected\r\n")
 
 			sshClient := ssh.NewClient(sshConn, nil, nil)
+			defer sshClient.Close()
 
 			session, err := sshClient.NewSession()
 			if err != nil {
 				log.Println("Session Failed")
 				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
-				sshClient.Close()
-				sshConn.Close()
-				c.Close()
-				cancel()
 				return
 			}
-			log.Println("Session Established")
+			term.Call("write", "Session Established\r\n")
+			defer session.Close()
 
 			stdin, err := session.StdinPipe()
 			if err != nil {
@@ -388,20 +231,18 @@ func main() {
 				fmt.Println(err.Error())
 			}
 
-			log.Println("Pipes ready")
-			inSSH = true
+			time.Sleep(1 * time.Second)
+			term.Call("clear", "")
+
 			term.Set("_inSSH", true)
+			defer func() {
+				term.Set("_inSSH", false)
+			}()
 
 			done := make(chan bool, 1)
+
 			// Input
 			go func() {
-				defer onDone.Invoke() // re-print the prompt
-				defer cancel()
-				defer c.Close()
-				defer sshConn.Close()
-				defer sshClient.Close()
-				defer session.Close()
-
 				for {
 					select {
 					case d := <-inputChan:
@@ -416,33 +257,27 @@ func main() {
 				}
 			}()
 
+			var wg sync.WaitGroup
+
 			// Output + Err
+			wg.Add(1)
 			go func() {
-				output := make([]byte, 512)
-				for {
-					n, err := stdout.Read(output)
-					if err != nil {
-						term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
-						return
-					}
-					term.Call("write", string(output[:n]))
+				defer wg.Done()
+				_, err := io.Copy(termWriter{term}, stdout)
+				if err != nil {
+					term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+					return
 				}
 			}()
 
+			wg.Add(1)
 			go func() {
-				output := make([]byte, 512)
-				for {
-					n, err := stderr.Read(output)
-					if err != nil {
-						term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
-						break
-					}
-					term.Call("write", string(output[:n]))
+				defer wg.Done()
+				_, err := io.Copy(termWriter{term}, stderr)
+				if err != nil {
+					term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
+					return
 				}
-				log.Printf("Closed connection")
-				done <- true
-				inSSH = false
-				term.Set("_inSSH", false)
 			}()
 
 			err = session.RequestPty("xterm", term.Get("rows").Int(), term.Get("cols").Int(), ssh.TerminalModes{})
@@ -450,11 +285,6 @@ func main() {
 			if err != nil {
 				log.Fatal("request for pseudo terminal failed: ", err)
 				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
-				session.Close()
-				sshClient.Close()
-				sshConn.Close()
-				c.Close()
-				cancel()
 				return
 			}
 
@@ -462,15 +292,14 @@ func main() {
 			if err != nil {
 				log.Println("Session Failed")
 				term.Call("write", fmt.Sprintf("Error: %v\r\n", err))
-				session.Close()
-				sshClient.Close()
-				sshConn.Close()
-				c.Close()
-				cancel()
 				return
 			}
 			log.Println("Shell started")
 
+			wg.Wait()
+			log.Printf("Closed connection")
+			// Close input
+			done <- true
 		}()
 		return nil
 	}))
@@ -481,13 +310,7 @@ func main() {
 		return nil
 	}))
 
-	ln, _, err := safesocket.Listen("", 0)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = srv.Run(context.Background(), ln)
-	log.Fatalf("ipnserver.Run exited: %v", err)
+	select {}
 }
 
 type termWriter struct {
@@ -499,46 +322,3 @@ func (w termWriter) Write(p []byte) (n int, err error) {
 	w.o.Call("write", string(r))
 	return len(p), nil
 }
-
-func handleIncomingTCP(c net.Conn, port uint16) {
-	if port != 80 {
-		log.Printf("incoming conn on port %v; closing", port)
-		c.Close()
-		return
-	}
-	log.Printf("incoming conn on port %v", port)
-	s := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			log.Printf("Got HTTP request: %+v", r)
-			if c := strings.TrimPrefix(r.URL.Path, "/"); c != "" {
-				body := js.Global().Get("document").Get("body")
-				body.Set("bgColor", c)
-			}
-		}),
-	}
-	err := s.Serve(&oneConnListener{conn: c})
-	log.Printf("http.Serve: %v", err)
-}
-
-type dummyAddr string
-type oneConnListener struct {
-	conn net.Conn
-}
-
-func (l *oneConnListener) Accept() (c net.Conn, err error) {
-	c = l.conn
-	if c == nil {
-		err = io.EOF
-		return
-	}
-	err = nil
-	l.conn = nil
-	return
-}
-
-func (l *oneConnListener) Close() error { return nil }
-
-func (l *oneConnListener) Addr() net.Addr { return dummyAddr("unused-address") }
-
-func (a dummyAddr) Network() string { return string(a) }
-func (a dummyAddr) String() string  { return string(a) }

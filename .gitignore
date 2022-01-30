@@ -10,6 +10,8 @@
 cmd/tailscale/tailscale
 cmd/tailscaled/tailscaled
 
+cmd/tsshd/tsshd
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -22,3 +24,7 @@ cmd/tailscaled/tailscaled
 # direnv config, this may be different for other people so it's probably safer
 # to make this nonspecific.
 .envrc
+
+node_modules/
+wasmtest/dist
+wasmtest/*.wasm
