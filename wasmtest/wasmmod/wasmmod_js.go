@@ -22,15 +22,13 @@ import (
 
 	"github.com/skip2/go-qrcode"
 	"golang.org/x/crypto/ssh"
+	"inet.af/netaddr"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnserver"
 	"tailscale.com/net/netns"
-	"tailscale.com/net/packet"
-	"tailscale.com/net/socks5/tssocks"
-	"tailscale.com/net/tstun"
+	"tailscale.com/net/tsdial"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine"
-	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/netstack"
 )
 
@@ -39,9 +37,13 @@ func main() {
 
 	inputChan := make(chan []byte, 10)
 
+	dialer := new(tsdial.Dialer) // mutated below (before used)
+
 	netns.SetEnabled(false)
 	var logf logger.Logf = log.Printf
-	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{})
+	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
+		Dialer: dialer,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -49,38 +51,35 @@ func main() {
 	if !ok {
 		log.Fatalf("%T is not a wgengine.InternalsGetter", eng)
 	}
-	ns, err := netstack.Create(logf, tunDev, eng, magicConn)
+
+	ns, err := netstack.Create(logf, tunDev, eng, magicConn, dialer)
 	if err != nil {
 		log.Fatalf("netstack.Create: %v", err)
 	}
 	ns.ProcessLocalIPs = true
 	ns.ProcessSubnets = true
+
+	// Not sure what this does
+	dialer.UseNetstackForIP = func(ip netaddr.IP) bool {
+		_, ok := eng.PeerForIP(ip)
+		return ok
+	}
+	dialer.NetstackDialTCP = func(ctx context.Context, dst netaddr.IPPort) (net.Conn, error) {
+		return ns.DialContextTCP(ctx, dst)
+	}
+	// ^ Copied from tailscaled
+
 	if err := ns.Start(); err != nil {
 		log.Fatalf("failed to start netstack: %v", err)
 	}
 
 	doc := js.Global().Get("document")
 	topBar := doc.Call("getElementById", "topbar")
-	topBarStyle := topBar.Get("style")
 	netmapEle := doc.Call("getElementById", "netmap")
 	loginEle := doc.Call("getElementById", "loginURL")
 
-	netstackHandlePacket := tunDev.PostFilterIn
-	tunDev.PostFilterIn = func(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
-		if p.IsEchoRequest() {
-			go func() {
-				topBarStyle.Set("background", "gray")
-				time.Sleep(100 * time.Millisecond)
-				topBarStyle.Set("background", "white")
-			}()
-		}
-		return netstackHandlePacket(p, t)
-	}
-
-	socksSrv := tssocks.NewServer(logger.WithPrefix(logf, "socks5: "), eng, ns)
-
 	var store ipn.StateStore = new(ipn.MemoryStore)
-	srv, err := ipnserver.New(log.Printf, "some-logid", store, eng, nil, ipnserver.Options{
+	srv, err := ipnserver.New(log.Printf, "some-logid", store, eng, dialer, nil, ipnserver.Options{
 		SurviveDisconnects: true,
 	})
 	if err != nil {
@@ -179,10 +178,10 @@ func main() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			c, err := socksSrv.Dialer(ctx, "tcp", net.JoinHostPort(host, "2200"))
+			c, err := dialer.UserDial(ctx, "tcp", net.JoinHostPort(host, "2200"))
 			if err != nil {
 				term.Call("write", fmt.Sprintf("Error establishing session: %v\r\n", err))
-				term.Call("write", "Try again or disconnect/reconnect to tailscale")
+				term.Call("write", "Try again or disconnect/reconnect to tailscale\r\n")
 				return
 			}
 			term.Call("write", "TCP Session Established\r\n")
